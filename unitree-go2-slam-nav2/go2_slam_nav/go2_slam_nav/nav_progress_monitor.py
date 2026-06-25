@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """订阅 Nav2 / explore_lite 状态，用中文输出导航/探索进度日志。"""
 
+import time
+
 import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
+from geometry_msgs.msg import Twist
 from rclpy.logging import LoggingSeverity
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -20,8 +23,14 @@ _GOAL_STATUS_CN = {
     GoalStatus.STATUS_CANCELING: '取消中',
     GoalStatus.STATUS_SUCCEEDED: '成功',
     GoalStatus.STATUS_CANCELED: '已取消',
-    GoalStatus.STATUS_ABORTED: '失败',
+    GoalStatus.STATUS_ABORTED: '中断',
 }
+
+_ACTIVE_STATUSES = (
+    GoalStatus.STATUS_EXECUTING,
+    GoalStatus.STATUS_ACCEPTED,
+    GoalStatus.STATUS_CANCELING,
+)
 
 _EXPLORE_STATUS_CN = {
     'exploration_started': '探索已开始',
@@ -37,24 +46,43 @@ class NavProgressMonitor(Node):
     def __init__(self) -> None:
         super().__init__('nav_progress_monitor')
         self.declare_parameter('slam_mode', 'mapping')
-        self.declare_parameter('heartbeat_sec', 15.0)
+        self.declare_parameter('heartbeat_sec', 8.0)
+        self.declare_parameter('stuck_heartbeat_sec', 4.0)
+        self.declare_parameter('aborted_warn_sec', 8.0)
         self.declare_parameter('nav_action_status_topic', '/navigate_to_pose/_action/status')
         self.declare_parameter('nav_action_feedback_topic', '/navigate_to_pose/_action/feedback')
         self.declare_parameter('explore_status_topic', '/explore/status')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('cmd_vel_stale_sec', 6.0)
 
         slam_mode = str(self.get_parameter('slam_mode').value).strip().lower()
         self._mode_label = _MODE_LABELS.get(slam_mode, slam_mode or '建图')
         self._heartbeat_sec = max(5.0, float(self.get_parameter('heartbeat_sec').value))
+        self._stuck_heartbeat_sec = max(3.0, float(self.get_parameter('stuck_heartbeat_sec').value))
+        self._aborted_warn_sec = max(2.0, float(self.get_parameter('aborted_warn_sec').value))
         self._nav_status_topic = str(self.get_parameter('nav_action_status_topic').value)
         self._explore_topic = str(self.get_parameter('explore_status_topic').value)
 
         self._goal_status = GoalStatus.STATUS_UNKNOWN
+        self._active_goal_id = None
         self._distance_remaining = -1.0
         self._explore_status = ''
         self._last_explore_status = ''
         self._nav_ready = False
         self._status_count = 0
         self._nav_client = None
+        self._recovery_pending = False
+        self._abort_warn_timer = None
+        self._cmd_vel_topic = str(self.get_parameter('cmd_vel_topic').value)
+        self._cmd_vel_stale_sec = max(3.0, float(self.get_parameter('cmd_vel_stale_sec').value))
+        self._last_cmd_vel_mono = 0.0
+        self._last_cmd_vel_nonzero = False
+        self._goal_start_mono = 0.0
+        self._blacklist_count = 0
+        self._frontiers_found = 0
+        self._frontiers_available = 0
+        self._last_heartbeat_key = None
+        self._last_heartbeat_log_mono = 0.0
 
         self.get_logger().set_level(LoggingSeverity.INFO)
 
@@ -99,10 +127,16 @@ class NavProgressMonitor(Node):
         except Exception:
             self._nav_client = None
 
-        self.create_timer(self._heartbeat_sec, self._heartbeat)
+        self.create_subscription(
+            Twist, self._cmd_vel_topic, self._on_cmd_vel, status_qos,
+        )
+
+        self._heartbeat_period = self._heartbeat_sec
+        self._heartbeat_timer = self.create_timer(self._heartbeat_period, self._heartbeat)
         self.get_logger().info(
             f'[任务进度] 导航监控已启动，模式={self._mode_label}，'
-            f'订阅 {self._nav_status_topic}，心跳 {self._heartbeat_sec:.0f}s。'
+            f'订阅 {self._nav_status_topic}，心跳 {self._heartbeat_sec:.0f}s'
+            f'（卡住时 {self._stuck_heartbeat_sec:.0f}s）。'
         )
 
     @staticmethod
@@ -113,53 +147,127 @@ class NavProgressMonitor(Node):
         except Exception:
             return None
 
+    @staticmethod
+    def _goal_id(entry) -> tuple:
+        goal_info = getattr(entry, 'goal_info', None)
+        if goal_info is None:
+            return ()
+        goal_id = getattr(goal_info, 'goal_id', None)
+        if goal_id is None:
+            return ()
+        uuid = getattr(goal_id, 'uuid', None)
+        if uuid is None:
+            return ()
+        return tuple(uuid)
+
+    def _pick_active_status(self, status_list):
+        """Prefer running goals; stale ABORTED entries stay in the action status array."""
+        executing = None
+        accepted = None
+        for entry in status_list:
+            status = int(entry.status)
+            if status == GoalStatus.STATUS_EXECUTING:
+                executing = entry
+            elif status == GoalStatus.STATUS_ACCEPTED and accepted is None:
+                accepted = entry
+        if executing is not None:
+            return executing
+        if accepted is not None:
+            return accepted
+        return status_list[-1]
+
+    def _cancel_abort_warn_timer(self) -> None:
+        if self._abort_warn_timer is not None:
+            self._abort_warn_timer.cancel()
+            self._abort_warn_timer.destroy()
+            self._abort_warn_timer = None
+
+    def _schedule_abort_warn(self) -> None:
+        self._cancel_abort_warn_timer()
+        self._abort_warn_timer = self.create_timer(
+            self._aborted_warn_sec, self._on_abort_warn_timeout)
+
+    def _on_abort_warn_timeout(self) -> None:
+        self._cancel_abort_warn_timer()
+        if self._goal_status != GoalStatus.STATUS_ABORTED:
+            return
+        self.get_logger().warn(
+            f'[任务进度] 模式={self._mode_label} | 导航阶段=失败 | '
+            f'目标在 {self._aborted_warn_sec:.0f}s 内未恢复。'
+            '可能原因：规划失败、被障碍阻挡或控制器超时；'
+            'Nav2 将换目标或等待 explore_lite 重试。'
+        )
+
     def _on_nav_status(self, msg: GoalStatusArray) -> None:
         self._status_count += 1
         self._nav_ready = True
         if not msg.status_list:
             if self._goal_status != GoalStatus.STATUS_UNKNOWN:
                 self._goal_status = GoalStatus.STATUS_UNKNOWN
+                self._active_goal_id = None
+                self._recovery_pending = False
+                self._cancel_abort_warn_timer()
                 self.get_logger().info(
                     f'[任务进度] 模式={self._mode_label} | 导航阶段=空闲 | '
                     'Nav2 就绪，等待导航目标。'
                 )
             return
 
-        latest = msg.status_list[-1]
-        new_status = int(latest.status)
-        if new_status == self._goal_status:
+        active = self._pick_active_status(msg.status_list)
+        new_status = int(active.status)
+        new_goal_id = self._goal_id(active)
+        if new_status == self._goal_status and new_goal_id == self._active_goal_id:
             return
 
-        old_cn = _GOAL_STATUS_CN.get(self._goal_status, str(self._goal_status))
+        old_status = self._goal_status
+        old_cn = _GOAL_STATUS_CN.get(old_status, str(old_status))
         new_cn = _GOAL_STATUS_CN.get(new_status, str(new_status))
         self._goal_status = new_status
+        self._active_goal_id = new_goal_id
 
         if new_status == GoalStatus.STATUS_EXECUTING:
-            self.get_logger().info(
-                f'[任务进度] 模式={self._mode_label} | 导航阶段=跟路径 | '
-                f'目标状态={new_cn}，正在向目标点移动。'
-            )
+            self._cancel_abort_warn_timer()
+            self._goal_start_mono = time.monotonic()
+            if self._recovery_pending:
+                self._recovery_pending = False
+                self.get_logger().info(
+                    f'[任务进度] 模式={self._mode_label} | 导航阶段=跟路径 | '
+                    f'{self._explore_stats_part()}'
+                    'Nav2 恢复后继续向目标点移动。'
+                )
+            else:
+                self.get_logger().info(
+                    f'[任务进度] 模式={self._mode_label} | 导航阶段=跟路径 | '
+                    f'{self._explore_stats_part()}'
+                    f'目标状态={new_cn}，开始移动。'
+                )
         elif new_status == GoalStatus.STATUS_SUCCEEDED:
+            self._recovery_pending = False
+            self._cancel_abort_warn_timer()
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段=到达 | '
                 f'目标状态={new_cn}，本段导航完成。'
             )
             self._distance_remaining = -1.0
         elif new_status == GoalStatus.STATUS_ABORTED:
-            self.get_logger().warn(
-                f'[任务进度] 模式={self._mode_label} | 导航阶段=失败 | '
-                f'目标状态={new_cn}（原 {old_cn}）。'
-                '可能原因：规划失败、被障碍阻挡或控制器超时；'
-                'Nav2 将按行为树尝试恢复（spin/wait，GO2 无倒车）。'
-            )
+            # BT recovery aborts follow_path/plan briefly; not a terminal failure.
+            self._recovery_pending = True
             self._distance_remaining = -1.0
+            self._schedule_abort_warn()
+            self.get_logger().info(
+                f'[任务进度] 模式={self._mode_label} | 导航阶段=恢复中 | '
+                f'本段路径受阻（{old_cn}→{new_cn}），Nav2 正在 spin/wait 重试。'
+            )
         elif new_status == GoalStatus.STATUS_CANCELED:
+            self._recovery_pending = False
+            self._cancel_abort_warn_timer()
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段=取消 | '
                 f'目标状态={new_cn}。'
             )
             self._distance_remaining = -1.0
         elif new_status == GoalStatus.STATUS_ACCEPTED:
+            self._cancel_abort_warn_timer()
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段=规划 | '
                 f'目标状态={new_cn}，全局路径计算中。'
@@ -170,6 +278,56 @@ class NavProgressMonitor(Node):
                 f'目标状态 {old_cn} → {new_cn}。'
             )
 
+    def _on_cmd_vel(self, msg: Twist) -> None:
+        moving = (
+            abs(msg.linear.x) > 0.02
+            or abs(msg.linear.y) > 0.02
+            or abs(msg.angular.z) > 0.05
+        )
+        if moving:
+            self._last_cmd_vel_mono = time.monotonic()
+            self._last_cmd_vel_nonzero = True
+
+    def _cmd_vel_stale(self) -> bool:
+        if not self._last_cmd_vel_nonzero:
+            if self._goal_status != GoalStatus.STATUS_EXECUTING:
+                return False
+            if self._goal_start_mono <= 0.0:
+                return False
+            return (time.monotonic() - self._goal_start_mono) > self._cmd_vel_stale_sec
+        return (time.monotonic() - self._last_cmd_vel_mono) > self._cmd_vel_stale_sec
+
+    def _cmd_vel_stale_elapsed(self) -> float:
+        if self._last_cmd_vel_nonzero:
+            return max(0.0, time.monotonic() - self._last_cmd_vel_mono)
+        if self._goal_start_mono > 0.0:
+            return max(0.0, time.monotonic() - self._goal_start_mono)
+        return 0.0
+
+    def _explore_stats_part(self) -> str:
+        if self._mode_label != '探索':
+            return ''
+        return (
+            f'已拉黑 {self._blacklist_count} 点，'
+            f'可用前沿 {self._frontiers_available}/{self._frontiers_found}，'
+        )
+
+    def _is_stuck_like(self) -> bool:
+        if self._goal_status == GoalStatus.STATUS_EXECUTING and self._cmd_vel_stale():
+            return True
+        if self._goal_status == GoalStatus.STATUS_ABORTED and self._recovery_pending:
+            return True
+        return False
+
+    def _maybe_adjust_heartbeat_timer(self) -> None:
+        period = self._stuck_heartbeat_sec if self._is_stuck_like() else self._heartbeat_sec
+        if abs(period - self._heartbeat_period) < 0.1:
+            return
+        self._heartbeat_period = period
+        self._heartbeat_timer.cancel()
+        self._heartbeat_timer.destroy()
+        self._heartbeat_timer = self.create_timer(self._heartbeat_period, self._heartbeat)
+
     def _on_nav_feedback(self, msg) -> None:
         feedback = msg.feedback
         dist = float(getattr(feedback, 'distance_remaining', -1.0))
@@ -178,15 +336,48 @@ class NavProgressMonitor(Node):
 
     def _on_explore_status(self, msg) -> None:
         status = str(getattr(msg, 'status', '') or '')
-        if not status or status == self._last_explore_status:
-            return
-        self._last_explore_status = status
-        self._explore_status = status
-        label = _EXPLORE_STATUS_CN.get(status, status)
-        level = self.get_logger().warn if status == 'exploration_complete' else self.get_logger().info
-        level(
-            f'[任务进度] 模式={self._mode_label} | 探索状态={label}。'
+        blacklist = int(getattr(msg, 'blacklist_count', 0))
+        frontiers_found = int(getattr(msg, 'frontiers_found', 0))
+        frontiers_available = int(getattr(msg, 'frontiers_available', 0))
+
+        blacklist_changed = blacklist != self._blacklist_count
+        frontier_stats_changed = (
+            frontiers_found != self._frontiers_found
+            or frontiers_available != self._frontiers_available
         )
+
+        if blacklist > self._blacklist_count:
+            self.get_logger().warn(
+                f'[任务进度] 模式={self._mode_label} | 探索拉黑 | '
+                f'已拉黑 {blacklist} 点，可用前沿 {frontiers_available}/{frontiers_found}。'
+            )
+        elif frontier_stats_changed and self._mode_label == '探索':
+            self.get_logger().info(
+                f'[任务进度] 模式={self._mode_label} | 前沿统计 | '
+                f'已拉黑 {blacklist} 点，可用前沿 {frontiers_available}/{frontiers_found}。'
+            )
+
+        self._blacklist_count = blacklist
+        self._frontiers_found = frontiers_found
+        self._frontiers_available = frontiers_available
+
+        if not status:
+            return
+        if status != self._last_explore_status:
+            self._last_explore_status = status
+            self._explore_status = status
+            label = _EXPLORE_STATUS_CN.get(status, status)
+            level = (
+                self.get_logger().warn
+                if status == 'exploration_complete'
+                else self.get_logger().info
+            )
+            level(
+                f'[任务进度] 模式={self._mode_label} | 探索状态={label} | '
+                f'已拉黑 {blacklist} 点，可用前沿 {frontiers_available}/{frontiers_found}。'
+            )
+        elif blacklist_changed or frontier_stats_changed:
+            self._last_heartbeat_key = None
 
     def _nav_phase_cn(self) -> str:
         if not self._nav2_server_available():
@@ -198,7 +389,7 @@ class NavProgressMonitor(Node):
         if self._goal_status in (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED):
             return '空闲'
         if self._goal_status == GoalStatus.STATUS_ABORTED:
-            return '失败待恢复'
+            return '恢复中' if self._recovery_pending else '失败'
         return '空闲'
 
     def _nav2_server_available(self) -> bool:
@@ -206,8 +397,46 @@ class NavProgressMonitor(Node):
             return True
         return self._nav_ready
 
+    def _heartbeat_snapshot_key(self):
+        stale = self._cmd_vel_stale()
+        stale_bucket = int(self._cmd_vel_stale_elapsed() // 2) if stale else 0
+        dist_bucket = (
+            round(self._distance_remaining, 1)
+            if self._distance_remaining >= 0.0
+            else -1.0
+        )
+        return (
+            self._goal_status,
+            dist_bucket,
+            self._explore_status,
+            self._blacklist_count,
+            self._frontiers_available,
+            stale,
+            stale_bucket,
+            self._recovery_pending,
+        )
+
+    def _should_log_heartbeat(self) -> bool:
+        key = self._heartbeat_snapshot_key()
+        now = time.monotonic()
+        if key == self._last_heartbeat_key:
+            return False
+        if (
+            not self._is_stuck_like()
+            and self._last_heartbeat_log_mono > 0.0
+            and (now - self._last_heartbeat_log_mono) < self._heartbeat_sec * 0.9
+        ):
+            return False
+        self._last_heartbeat_key = key
+        self._last_heartbeat_log_mono = now
+        return True
+
     def _heartbeat(self) -> None:
+        self._maybe_adjust_heartbeat_timer()
+
         if not self._nav2_server_available():
+            if not self._should_log_heartbeat():
+                return
             self.get_logger().warn(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段=未就绪 | '
                 f'Nav2 action server ({self._nav_status_topic.rsplit("/", 2)[0]}) 尚不可用。'
@@ -215,33 +444,53 @@ class NavProgressMonitor(Node):
             )
             return
 
+        if not self._should_log_heartbeat():
+            return
+
         explore_part = ''
         if self._explore_status:
             explore_part = (
                 f'探索={_EXPLORE_STATUS_CN.get(self._explore_status, self._explore_status)}，'
             )
+        stats_part = self._explore_stats_part()
 
         dist_part = ''
         if self._goal_status == GoalStatus.STATUS_EXECUTING and self._distance_remaining >= 0.0:
             dist_part = f'剩余约 {self._distance_remaining:.2f}m，'
 
         if self._goal_status == GoalStatus.STATUS_EXECUTING:
+            if self._cmd_vel_stale():
+                elapsed = self._cmd_vel_stale_elapsed()
+                cancel_in = max(0.0, self._cmd_vel_stale_sec - elapsed)
+                self.get_logger().warn(
+                    f'[任务进度] 模式={self._mode_label} | 导航阶段=静止等待 | '
+                    f'{explore_part}{stats_part}{dist_part}'
+                    f'已静止 {elapsed:.0f}s（无 cmd_vel），'
+                    f'约 {cancel_in:.0f}s 后 explore 拉黑换点。'
+                )
+            else:
+                self.get_logger().info(
+                    f'[任务进度] 模式={self._mode_label} | 导航阶段=移动中 | '
+                    f'{explore_part}{stats_part}{dist_part}'
+                    f'机器狗正在向目标点移动。'
+                )
+        elif self._goal_status == GoalStatus.STATUS_ABORTED and self._recovery_pending:
             self.get_logger().info(
-                f'[任务进度] 模式={self._mode_label} | 导航阶段={self._nav_phase_cn()} | '
-                f'{explore_part}{dist_part}'
-                f'代价地图=/map_obstacles + /go2/cloud。'
+                f'[任务进度] 模式={self._mode_label} | 导航阶段=脱困重试 | '
+                f'{explore_part}{stats_part}'
+                'Nav2 正在 spin/wait 重试，机器狗可能短暂静止。'
             )
         elif self._goal_status in (GoalStatus.STATUS_UNKNOWN, GoalStatus.STATUS_SUCCEEDED,
                                    GoalStatus.STATUS_CANCELED):
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段={self._nav_phase_cn()} | '
-                f'{explore_part}'
-                'Nav2 就绪，等待 RViz「2D Goal Pose」或 explore_lite 发目标。'
+                f'{explore_part}{stats_part}'
+                'Nav2 就绪，等待新目标。'
             )
         else:
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段={self._nav_phase_cn()} | '
-                f'{explore_part}'
+                f'{explore_part}{stats_part}'
                 f'目标状态={_GOAL_STATUS_CN.get(self._goal_status, self._goal_status)}。'
             )
 

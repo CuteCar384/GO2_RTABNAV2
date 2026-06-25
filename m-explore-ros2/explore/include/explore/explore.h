@@ -41,7 +41,12 @@
 #include <explore/costmap_client.h>
 #include <explore/frontier_search.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#ifdef EXPLORE_TF2_ROS_LEGACY_HEADERS
+#include <tf2_ros/transform_listener.h>
+#else
 #include <tf2_ros/transform_listener.hpp>
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -96,7 +101,17 @@ private:
   void visualizeFrontiers(
       const std::vector<frontier_exploration::Frontier>& frontiers);
 
-  bool goalOnBlacklist(const geometry_msgs::msg::Point& goal);
+  bool goalOnBlacklist(const geometry_msgs::msg::Point& goal) const;
+  bool updateRobotProgress();
+  bool robotStuck() const;
+  bool cmdVelStale() const;
+  bool lookupOdomPosition(geometry_msgs::msg::Point& out) const;
+  void cancelStuckGoal(const std::string& reason);
+  void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
+  void publishExploreStatus(const std::string& status, size_t frontiers_found = 0,
+                            size_t frontiers_available = 0, bool use_cached_frontiers = true);
+  size_t countAvailableFrontiers(
+      const std::vector<frontier_exploration::Frontier>& frontiers) const;
 
   NavigationGoalHandle::SharedPtr navigation_goal_handle_;
   // void
@@ -125,6 +140,7 @@ private:
   // rclcpp::TimerBase::SharedPtr oneshot_;
 
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_subscription_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_subscription_;
   void resumeCallback(const std_msgs::msg::Bool::SharedPtr msg);
 
   std::vector<geometry_msgs::msg::Point> frontier_blacklist_;
@@ -132,6 +148,9 @@ private:
   double prev_distance_;
   rclcpp::Time last_progress_;
   size_t last_markers_count_;
+  size_t last_frontiers_found_{0};
+  size_t last_frontiers_available_{0};
+  std::string last_explore_status_;
 
   geometry_msgs::msg::Pose initial_pose_;
   void returnToInitialPose(void);
@@ -140,11 +159,25 @@ private:
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
   double progress_timeout_;
+  double robot_progress_timeout_;
+  double robot_progress_radius_;
+  double cmd_vel_stale_timeout_;
+  double cmd_vel_linear_threshold_;
+  double cmd_vel_angular_threshold_;
+  std::string cmd_vel_topic_;
   bool visualize_;
   bool return_to_init_;
   std::string robot_base_frame_;
+  std::string progress_odom_frame_;
   bool resuming_ = false;
   bool goal_active_{false};
+  bool stopped_{false};
+  bool last_robot_pose_valid_{false};
+  geometry_msgs::msg::Point last_robot_pose_;
+  rclcpp::Time last_robot_movement_time_;
+  rclcpp::Time last_cmd_vel_time_;
+  rclcpp::Time goal_start_time_;
+  bool saw_cmd_vel_{false};
   rclcpp_action::GoalUUID active_goal_id_;
 };
 }  // namespace explore

@@ -116,7 +116,8 @@ def generate_launch_description():
                     arguments=['--ros-args', '--log-level', 'info'],
                     parameters=[{
                         'slam_mode': LaunchConfiguration('slam_mode'),
-                        'heartbeat_sec': 15.0,
+                        'heartbeat_sec': 8.0,
+                        'stuck_heartbeat_sec': 4.0,
                     }],
                 ),
                 IncludeLaunchDescription(
