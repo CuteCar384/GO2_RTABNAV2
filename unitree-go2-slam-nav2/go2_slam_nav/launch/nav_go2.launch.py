@@ -111,7 +111,7 @@ def generate_launch_description():
                 'min_linear_speed': 0.15,
                 'min_lateral_speed': 0.0,
                 'allow_lateral': False,
-                'min_angular_speed': 0.2,
+                'min_angular_speed': 0.15,
             }],
         ),
 
@@ -127,7 +127,7 @@ def generate_launch_description():
                     parameters=[{
                         'slam_mode': LaunchConfiguration('slam_mode'),
                         'heartbeat_sec': 8.0,
-                        'stuck_heartbeat_sec': 4.0,
+                        'frontier_stats_log_sec': 30.0,
                     }],
                 ),
                 IncludeLaunchDescription(

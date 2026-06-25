@@ -164,6 +164,8 @@ private:
   double cmd_vel_stale_timeout_;
   double cmd_vel_linear_threshold_;
   double cmd_vel_angular_threshold_;
+  double goal_tolerance_;
+  double min_goal_interval_;
   std::string cmd_vel_topic_;
   bool visualize_;
   bool return_to_init_;
@@ -171,12 +173,15 @@ private:
   std::string progress_odom_frame_;
   bool resuming_ = false;
   bool goal_active_{false};
+  bool pursuit_active_{false};
   bool stopped_{false};
   bool last_robot_pose_valid_{false};
   geometry_msgs::msg::Point last_robot_pose_;
   rclcpp::Time last_robot_movement_time_;
   rclcpp::Time last_cmd_vel_time_;
   rclcpp::Time goal_start_time_;
+  rclcpp::Time last_goal_sent_time_;
+  rclcpp::Time last_status_publish_time_;
   bool saw_cmd_vel_{false};
   rclcpp_action::GoalUUID active_goal_id_;
 };

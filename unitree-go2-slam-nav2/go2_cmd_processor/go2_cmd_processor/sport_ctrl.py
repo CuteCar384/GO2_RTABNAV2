@@ -18,7 +18,7 @@ class Go2CmdProcessor(Node):
         self.declare_parameter("min_linear_speed", 0.15)
         self.declare_parameter("min_lateral_speed", 0.0)
         self.declare_parameter("allow_lateral", False)
-        self.declare_parameter("min_angular_speed", 0.2)
+        self.declare_parameter("min_angular_speed", 0.15)
         self.declare_parameter("zero_epsilon", 0.02)
         self.declare_parameter("allow_reverse_in_recovery", True)
         self.declare_parameter(

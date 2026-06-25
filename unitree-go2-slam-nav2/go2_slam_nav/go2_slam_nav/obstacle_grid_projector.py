@@ -359,8 +359,8 @@ class ObstacleGridProjector(Node):
         self._last_publish_mono = self.get_clock().now().nanoseconds * 1e-9
 
         self.get_logger().info(
-            f'Published /map_obstacles ({width}x{height}), '
-            f'rtab={cloud_count} live={live_count} pts',
+            f'已发布 /map_obstacles ({width}x{height})，'
+            f'rtab 点云 {cloud_count}，实时 {live_count} 点',
             throttle_duration_sec=5.0,
         )
 

@@ -59,9 +59,9 @@ controller_server:
       min_vel_y: 0.0
       max_vel_x: 0.3
       max_vel_y: 0.0
-      max_vel_theta: 0.5
+      max_vel_theta: 0.45
       min_speed_xy: 0.15
-      min_speed_theta: 0.2
+      min_speed_theta: 0.15
       max_speed_xy: 0.3
       acc_lim_x: 1.5
       acc_lim_y: 0.0
@@ -185,8 +185,8 @@ recoveries_server:
     robot_base_frame: go2_base_link
     transform_timeout: 0.3
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.5
-    min_rotational_vel: 0.3
+    max_rotational_vel: 0.45
+    min_rotational_vel: 0.25
     rotational_acc_lim: 2.0
 
 waypoint_follower:
