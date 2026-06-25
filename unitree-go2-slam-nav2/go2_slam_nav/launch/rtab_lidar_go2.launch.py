@@ -5,7 +5,7 @@
 #   - /utlidar/cloud_base      (sensor_msgs/PointCloud2, frame: base_link, gravity-leveled)
 #   - /utlidar/cloud           (raw lidar frame, only if manual extrinsic transform is needed)
 #
-# Default: cloud_deskewed (motion-compensated) + robot_odom -> body frame.
+# GO2_POINT_LIO2 validated chain: cloud_deskewed (odom) + robot_odom -> body frame.
 #   - /utlidar/robot_odom   (nav_msgs/Odometry, odom -> base_link)
 #   - TF: odom -> base_link, base_link -> utlidar_lidar (published by GO2 onboard)
 #
@@ -50,8 +50,8 @@ RTABMAP_TUNING_BASE = [
     'Vis/MaxFeatures', '0',
     'Kp/MaxFeatures', '0',
     'Kp/DetectorStrategy', '0',
-    'RGBD/AngularUpdate', '0.02',
-    'RGBD/LinearUpdate', '0.02',
+    'RGBD/AngularUpdate', '0.05',
+    'RGBD/LinearUpdate', '0.05',
     'RGBD/CreateOccupancyGrid', 'true',
     'Grid/Sensor', '0',
     'Grid/RangeMin', '0.3',
@@ -240,7 +240,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'cloud_in', default_value='/utlidar/cloud_deskewed',
-            description='GO2 cloud input (cloud_deskewed + robot_odom)',
+            description='GO2 cloud input (cloud_deskewed + robot_odom, GO2_POINT_LIO2 chain)',
         ),
         DeclareLaunchArgument(
             'cloud_frame_mode', default_value='deskewed',
@@ -290,9 +290,7 @@ def generate_launch_description():
                 'flatten_odom_3dof': True,
                 'odom_frame_id': 'go2_odom',
                 'base_frame_id': LaunchConfiguration('base_frame_id'),
-                'deskewed_max_odom_delta': 0.25,
-                'use_source_stamp': False,
-                'deskewed_sync_odom': True,
+                'deskewed_max_odom_delta': 0.5,
             }],
             remappings=GO2_TF_REMAPPINGS,
             condition=IfCondition(LaunchConfiguration('use_stamp_relay')),

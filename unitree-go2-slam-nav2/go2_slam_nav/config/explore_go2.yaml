@@ -8,13 +8,10 @@
     costmap_topic: /map_obstacles
     costmap_updates_topic: /map_obstacles_updates
     visualize: true
-    planner_frequency: 1.0
-    progress_timeout: 30.0
-    robot_progress_timeout: 12.0
-    robot_progress_radius: 0.12
-    progress_odom_frame: go2_odom
+    planner_frequency: 0.15
+    progress_timeout: 60.0
     potential_scale: 3.0
     orientation_scale: 0.0
     gain_scale: 1.0
-    transform_tolerance: 1.0
+    transform_tolerance: 0.3
     min_frontier_size: 0.3

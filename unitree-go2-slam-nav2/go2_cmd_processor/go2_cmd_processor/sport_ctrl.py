@@ -15,10 +15,9 @@ class Go2CmdProcessor(Node):
         self.declare_parameter("rate", 200.0)
         self.declare_parameter("cmd_vel_timeout", 0.25)  # Timeout in seconds
         self.declare_parameter("log_level", "info")  # Logging level
-        self.declare_parameter("min_linear_speed", 0.15)
-        self.declare_parameter("min_lateral_speed", 0.0)
-        self.declare_parameter("allow_lateral", False)
-        self.declare_parameter("min_angular_speed", 0.2)
+        self.declare_parameter("min_linear_speed", 0.3)
+        self.declare_parameter("min_lateral_speed", 0.15)
+        self.declare_parameter("min_angular_speed", 0.3)
         self.declare_parameter("zero_epsilon", 0.02)
         self.declare_parameter("allow_reverse_in_recovery", True)
         self.declare_parameter(
@@ -40,7 +39,6 @@ class Go2CmdProcessor(Node):
         self.cmd_vel_timeout = self.get_parameter("cmd_vel_timeout").value
         self.min_linear_speed = self.get_parameter("min_linear_speed").value
         self.min_lateral_speed = self.get_parameter("min_lateral_speed").value
-        self.allow_lateral = bool(self.get_parameter("allow_lateral").value)
         self.min_angular_speed = self.get_parameter("min_angular_speed").value
         self.zero_epsilon = self.get_parameter("zero_epsilon").value
         self.allow_reverse_in_recovery = bool(
@@ -113,13 +111,12 @@ class Go2CmdProcessor(Node):
         )
 
     def apply_velocity_limits(self, msg: Twist) -> Twist:
-        """GO2: forward + yaw only; reverse only during Nav2 BackUp recovery."""
+        """GO2: holonomic strafe; reverse only during Nav2 BackUp recovery."""
         vx = msg.linear.x
-        vy = 0.0 if not self.allow_lateral else msg.linear.y
+        vy = msg.linear.y
         wz = msg.angular.z
 
         def snap_min(value: float, minimum: float) -> float:
-            """Snap sub-min commands to minimum (stiction); pass >= min through."""
             if abs(value) <= self.zero_epsilon:
                 return 0.0
             if abs(value) < minimum:
@@ -129,12 +126,10 @@ class Go2CmdProcessor(Node):
         reverse_ok = self.allow_reverse_in_recovery and self._backup_active
         if vx < 0.0 and not reverse_ok:
             vx = 0.0
-        elif vx > 0.0:
+        else:
             vx = snap_min(vx, self.min_linear_speed)
-        if self.allow_lateral:
-            vy = snap_min(vy, self.min_lateral_speed)
-        if abs(wz) > self.zero_epsilon:
-            wz = snap_min(wz, self.min_angular_speed)
+        vy = snap_min(vy, self.min_lateral_speed)
+        wz = snap_min(wz, self.min_angular_speed)
 
         out = Twist()
         out.linear.x = vx

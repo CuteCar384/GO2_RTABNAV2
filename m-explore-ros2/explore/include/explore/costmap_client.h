@@ -38,13 +38,8 @@
 #ifndef COSTMAP_CLIENT_
 #define COSTMAP_CLIENT_
 
-#ifdef EXPLORE_TF2_ROS_LEGACY_HEADERS
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
-#else
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_listener.hpp>
-#endif
 
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>

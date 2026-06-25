@@ -1,6 +1,5 @@
 import math
 from collections import deque
-from typing import Optional
 
 import numpy as np
 import rclpy
@@ -61,6 +60,8 @@ class SensorStampRelay(Node):
     def __init__(self):
         super().__init__('sensor_stamp_relay')
 
+        # GO2_POINT_LIO2 validated chain: /utlidar/cloud_deskewed (odom frame)
+        # is converted back to body using /utlidar/robot_odom.
         self.declare_parameter('cloud_in', '/utlidar/cloud_deskewed')
         self.declare_parameter('cloud_out', '/go2/cloud')
         self.declare_parameter('odom_in', '/utlidar/robot_odom')
@@ -68,12 +69,12 @@ class SensorStampRelay(Node):
         self.declare_parameter('republish_cloud', True)
         self.declare_parameter('republish_odom', True)
         self.declare_parameter('publish_odom_tf', True)
+        # deskewed: cloud_deskewed in odom -> body via robot_odom
+        # base: cloud_base already in base_link, passthrough
+        # raw: /utlidar/cloud + URDF extrinsic
         self.declare_parameter('cloud_frame_mode', 'deskewed')
-        self.declare_parameter('deskewed_max_odom_delta', 0.25)
-        self.declare_parameter('odom_buffer_size', 60)
-        # GO2 onboard stamps often differ from host clock; default wall-time restamp.
-        self.declare_parameter('use_source_stamp', False)
-        self.declare_parameter('deskewed_sync_odom', True)
+        self.declare_parameter('deskewed_max_odom_delta', 0.5)
+        self.declare_parameter('odom_buffer_size', 30)
         self.declare_parameter('transform_cloud_to_base', False)
         self.declare_parameter('flatten_odom_3dof', True)
         self.declare_parameter('odom_frame_id', 'go2_odom')
@@ -92,12 +93,11 @@ class SensorStampRelay(Node):
         self.cloud_frame_mode = str(self.get_parameter('cloud_frame_mode').value).lower()
         self.deskewed_max_odom_delta = float(self.get_parameter('deskewed_max_odom_delta').value)
         self.odom_buffer_size = int(self.get_parameter('odom_buffer_size').value)
-        self.use_source_stamp = _as_bool(self.get_parameter('use_source_stamp').value)
-        self.deskewed_sync_odom = _as_bool(self.get_parameter('deskewed_sync_odom').value)
         self.tf_broadcaster = TransformBroadcaster(self)
         self._odom_buffer = deque(maxlen=max(self.odom_buffer_size, 2))
-        self._clock_skew_logged = False
+        self._deskewed_drop_count = 0
 
+        # Backward compatibility: transform_cloud_to_base=true implies raw mode.
         if _as_bool(self.get_parameter('transform_cloud_to_base').value):
             self.cloud_frame_mode = 'raw'
 
@@ -131,7 +131,7 @@ class SensorStampRelay(Node):
             )
             self.get_logger().info(
                 f'Odom relay: {self.get_parameter("odom_in").value} -> {odom_out} '
-                f'(flatten_3dof={self.flatten_odom_3dof}, sync={self.deskewed_sync_odom})'
+                f'(flatten_3dof={self.flatten_odom_3dof})'
             )
 
         if self.get_parameter('republish_cloud').value:
@@ -145,26 +145,8 @@ class SensorStampRelay(Node):
             )
             self.get_logger().info(
                 f'Cloud relay: {self.get_parameter("cloud_in").value} -> {cloud_out} '
-                f'(mode={self.cloud_frame_mode}, use_source_stamp={self.use_source_stamp})'
+                f'(mode={self.cloud_frame_mode})'
             )
-
-    def _wall_stamp(self):
-        return self.get_clock().now().to_msg()
-
-    def _output_stamp(self, source_stamp):
-        if self.use_source_stamp:
-            wall = self.get_clock().now()
-            skew = abs(_stamp_to_sec(source_stamp) - wall.nanoseconds * 1e-9)
-            if skew > 1.0:
-                if not self._clock_skew_logged:
-                    self.get_logger().warn(
-                        f'GO2/cloud stamp skew {skew:.1f}s vs host — using wall time '
-                        f'(set use_source_stamp:=false to silence)'
-                    )
-                    self._clock_skew_logged = True
-                return self._wall_stamp()
-            return source_stamp
-        return self._wall_stamp()
 
     def _make_cloud_header(self, stamp) -> Header:
         header = Header()
@@ -172,7 +154,7 @@ class SensorStampRelay(Node):
         header.frame_id = self.base_frame_id
         return header
 
-    def _nearest_odom(self, cloud_stamp) -> Optional[Odometry]:
+    def _nearest_odom(self, cloud_stamp) -> Odometry | None:
         if not self._odom_buffer:
             return None
 
@@ -187,12 +169,13 @@ class SensorStampRelay(Node):
                 best_dt = dt
 
         if best_dt > self.deskewed_max_odom_delta:
+            latest = self._odom_buffer[-1]
             self.get_logger().warn(
-                f'deskewed cloud skipped: cloud/odom delta {best_dt * 1000.0:.1f} ms > '
-                f'{self.deskewed_max_odom_delta * 1000.0:.0f} ms',
+                f'deskewed cloud/odom stamp delta {best_dt * 1000.0:.1f} ms > '
+                f'{self.deskewed_max_odom_delta * 1000.0:.0f} ms; using latest odom',
                 throttle_duration_sec=5.0,
             )
-            return None
+            return latest
         return best
 
     def _transform_odom_cloud_to_base(self, msg: PointCloud2, odom: Odometry) -> list:
@@ -204,6 +187,7 @@ class SensorStampRelay(Node):
             pose.orientation.w,
         )
         trans = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=np.float64)
+        # p_odom = R @ p_base + t  =>  p_base = R^T @ (p_odom - t)
         rot_body_from_odom = rot.T
 
         field_names = [field.name for field in msg.fields]
@@ -236,63 +220,22 @@ class SensorStampRelay(Node):
             transformed.append(tuple(values))
         return transformed
 
-    def _build_odom_msg(self, msg: Odometry, stamp) -> Odometry:
-        out = Odometry()
-        out.header.stamp = stamp
-        out.header.frame_id = self.odom_frame_id
-        out.child_frame_id = self.base_frame_id
-        out.pose = msg.pose
-        out.twist = msg.twist
-
-        if self.flatten_odom_3dof:
-            q = msg.pose.pose.orientation
-            yaw = _yaw_from_quaternion(q.x, q.y, q.z, q.w)
-            out.pose.pose.position.z = 0.0
-            out.pose.pose.orientation.x = 0.0
-            out.pose.pose.orientation.y = 0.0
-            out.pose.pose.orientation.z = math.sin(yaw * 0.5)
-            out.pose.pose.orientation.w = math.cos(yaw * 0.5)
-        return out
-
-    def _publish_odom_tf(self, out: Odometry, stamp) -> None:
-        if not self.publish_odom_tf:
-            return
-        transform = TransformStamped()
-        transform.header.stamp = stamp
-        transform.header.frame_id = self.odom_frame_id
-        transform.child_frame_id = self.base_frame_id
-        transform.transform.translation.x = out.pose.pose.position.x
-        transform.transform.translation.y = out.pose.pose.position.y
-        transform.transform.translation.z = out.pose.pose.position.z
-        transform.transform.rotation = out.pose.pose.orientation
-        self.tf_broadcaster.sendTransform(transform)
-
-    def _publish_synced_odom(self, odom: Odometry, stamp) -> None:
-        if not hasattr(self, 'odom_pub'):
-            return
-        out = self._build_odom_msg(odom, stamp)
-        self.odom_pub.publish(out)
-        self._publish_odom_tf(out, stamp)
-
     def _cloud_cb(self, msg: PointCloud2):
-        stamp = self._output_stamp(msg.header.stamp)
+        stamp = self.get_clock().now().to_msg()
         header = self._make_cloud_header(stamp)
 
         if self.cloud_frame_mode == 'deskewed':
             odom = self._nearest_odom(msg.header.stamp)
             if odom is None:
-                if not self._odom_buffer:
-                    self.get_logger().warn(
-                        'deskewed cloud skipped: no robot_odom in buffer yet',
-                        throttle_duration_sec=5.0,
-                    )
+                self.get_logger().warn(
+                    'deskewed cloud skipped: no robot_odom in buffer yet',
+                    throttle_duration_sec=5.0,
+                )
                 return
             transformed = self._transform_odom_cloud_to_base(msg, odom)
             out = pc2.create_cloud(header, msg.fields, transformed)
             out.is_dense = msg.is_dense
             self.cloud_pub.publish(out)
-            if self.deskewed_sync_odom:
-                self._publish_synced_odom(odom, stamp)
             return
 
         if self.cloud_frame_mode == 'raw':
@@ -302,6 +245,7 @@ class SensorStampRelay(Node):
             self.cloud_pub.publish(out)
             return
 
+        # base/passthrough mode: cloud already in body frame (e.g. /utlidar/cloud_base)
         out = PointCloud2()
         out.header = header
         out.height = msg.height
@@ -317,13 +261,37 @@ class SensorStampRelay(Node):
     def _odom_cb(self, msg: Odometry):
         self._odom_buffer.append(msg)
 
-        if self.cloud_frame_mode == 'deskewed' and self.deskewed_sync_odom:
+        stamp = self.get_clock().now().to_msg()
+        out = Odometry()
+        out.header.stamp = stamp
+        out.header.frame_id = self.odom_frame_id
+        out.child_frame_id = self.base_frame_id
+        out.pose = msg.pose
+        out.twist = msg.twist
+
+        if self.flatten_odom_3dof:
+            q = msg.pose.pose.orientation
+            yaw = _yaw_from_quaternion(q.x, q.y, q.z, q.w)
+            out.pose.pose.position.z = 0.0
+            out.pose.pose.orientation.x = 0.0
+            out.pose.pose.orientation.y = 0.0
+            out.pose.pose.orientation.z = math.sin(yaw * 0.5)
+            out.pose.pose.orientation.w = math.cos(yaw * 0.5)
+
+        self.odom_pub.publish(out)
+
+        if not self.publish_odom_tf:
             return
 
-        stamp = self._output_stamp(msg.header.stamp)
-        out = self._build_odom_msg(msg, stamp)
-        self.odom_pub.publish(out)
-        self._publish_odom_tf(out, stamp)
+        transform = TransformStamped()
+        transform.header.stamp = stamp
+        transform.header.frame_id = self.odom_frame_id
+        transform.child_frame_id = self.base_frame_id
+        transform.transform.translation.x = out.pose.pose.position.x
+        transform.transform.translation.y = out.pose.pose.position.y
+        transform.transform.translation.z = out.pose.pose.position.z
+        transform.transform.rotation = out.pose.pose.orientation
+        self.tf_broadcaster.sendTransform(transform)
 
 
 def main(args=None):

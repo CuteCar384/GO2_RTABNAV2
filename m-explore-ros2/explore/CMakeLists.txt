@@ -25,10 +25,6 @@ if("$ENV{ROS_DISTRO}" STREQUAL "eloquent")
 elseif("$ENV{ROS_DISTRO}" STREQUAL "dashing")
   message(STATUS "Build for ROS2 dashing")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DDASHING")
-elseif("$ENV{ROS_DISTRO}" STREQUAL "foxy")
-  message(STATUS "Build for ROS2 foxy")
-  set(EXPLORE_TF2_ROS_LEGACY_HEADERS ON)
-  set(EXPLORE_ROS_FOXY ON)
 else()
   message(STATUS "BuilD for ROS2: " "$ENV{ROS_DISTRO}")
 endif()
@@ -91,7 +87,7 @@ target_include_directories(explore PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
-set(_explore_link_libs
+target_link_libraries(explore PUBLIC
   ${explore_lite_msgs_TARGETS}
   ${geometry_msgs_TARGETS}
   ${map_msgs_TARGETS}
@@ -99,25 +95,14 @@ set(_explore_link_libs
   ${nav_msgs_TARGETS}
   ${std_msgs_TARGETS}
   ${visualization_msgs_TARGETS}
+  nav2_costmap_2d::filters
   rclcpp::rclcpp
   tf2::tf2
   tf2_ros::tf2_ros
 )
-if(TARGET nav2_costmap_2d::filters)
-  list(APPEND _explore_link_libs nav2_costmap_2d::filters)
-else()
-  list(APPEND _explore_link_libs ${nav2_costmap_2d_LIBRARIES})
-endif()
-target_link_libraries(explore PUBLIC ${_explore_link_libs})
 
 if(nav2_msgs_VERSION VERSION_GREATER_EQUAL "1.3.0")
   target_compile_definitions(explore PRIVATE NAV2_RESULT_HAS_ERROR_CODE)
-endif()
-if(EXPLORE_TF2_ROS_LEGACY_HEADERS)
-  target_compile_definitions(explore PRIVATE EXPLORE_TF2_ROS_LEGACY_HEADERS)
-endif()
-if(EXPLORE_ROS_FOXY)
-  target_compile_definitions(explore PRIVATE EXPLORE_ROS_FOXY)
 endif()
 
 install(TARGETS explore

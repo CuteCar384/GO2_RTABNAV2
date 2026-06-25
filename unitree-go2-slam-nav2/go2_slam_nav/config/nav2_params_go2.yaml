@@ -46,27 +46,27 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       min_vel_x: 0.0
-      min_vel_y: 0.0
-      # No backward in FollowPath; no lateral strafe on GO2.
+      min_vel_y: -0.15
+      # No backward in FollowPath; holonomic lateral (strafe) enabled.
       max_vel_x: 0.3
-      max_vel_y: 0.0
+      max_vel_y: 0.15
       max_vel_theta: 0.5
       min_speed_xy: 0.15
-      min_speed_theta: 0.2
+      min_speed_theta: 0.3
       max_speed_xy: 0.3
       acc_lim_x: 1.5
-      acc_lim_y: 0.0
+      acc_lim_y: 1.5
       acc_lim_theta: 2.0
-      decel_lim_x: -2.5
-      decel_lim_y: 0.0
+      decel_lim_x: -1.5
+      decel_lim_y: -1.5
       decel_lim_theta: -2.0
-      vx_samples: 15
-      vy_samples: 1
-      vtheta_samples: 15
+      vx_samples: 20
+      vy_samples: 20
+      vtheta_samples: 20
       sim_time: 1.7
       transform_tolerance: 0.3
       xy_goal_tolerance: 0.15
-      trans_stopped_velocity: 0.12
+      trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
@@ -75,16 +75,15 @@ controller_server:
       PathAlign.scale: 20.0
       GoalAlign.scale: 18.0
       PathDist.scale: 32.0
-      GoalDist.scale: 32.0
-      RotateToGoal.scale: 40.0
-      RotateToGoal.slowing_factor: 5.5
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
 
 local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: false
-      update_frequency: 10.0
-      publish_frequency: 5.0
+      update_frequency: 5.0
+      publish_frequency: 2.0
       global_frame: go2_odom
       robot_base_frame: go2_base_link
       rolling_window: true
@@ -222,13 +221,13 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.3, 0.0, 0.5]
-    # Negative x: BackUp recovery only. No lateral strafe.
-    min_velocity: [-0.3, 0.0, -0.5]
+    max_velocity: [0.3, 0.15, 0.5]
+    # Negative x: BackUp recovery only. Lateral ±0.15 (forward still up to 0.3).
+    min_velocity: [-0.3, -0.15, -0.5]
     max_accel: [1.5, 1.5, 2.0]
     max_decel: [-1.5, -1.5, -2.0]
     odom_topic: "/go2/odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
-    # sport_ctrl min_linear_speed 0.15 m/s; DWB min_speed_xy must match for goal approach
+    # sport_ctrl enforces 0.3 m/s floor on hardware; DWB min_speed_* aligns planner output
     velocity_timeout: 1.0

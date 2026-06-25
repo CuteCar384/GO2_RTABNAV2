@@ -41,11 +41,7 @@
 #include <explore/costmap_client.h>
 #include <explore/frontier_search.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
-#ifdef EXPLORE_TF2_ROS_LEGACY_HEADERS
-#include <tf2_ros/transform_listener.h>
-#else
 #include <tf2_ros/transform_listener.hpp>
-#endif
 
 #include <chrono>
 #include <cmath>
@@ -101,9 +97,6 @@ private:
       const std::vector<frontier_exploration::Frontier>& frontiers);
 
   bool goalOnBlacklist(const geometry_msgs::msg::Point& goal);
-  bool updateRobotProgress();
-  bool robotStuck() const;
-  bool lookupOdomPosition(geometry_msgs::msg::Point& out) const;
 
   NavigationGoalHandle::SharedPtr navigation_goal_handle_;
   // void
@@ -147,18 +140,11 @@ private:
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
   double progress_timeout_;
-  double robot_progress_timeout_;
-  double robot_progress_radius_;
   bool visualize_;
   bool return_to_init_;
   std::string robot_base_frame_;
-  std::string progress_odom_frame_;
   bool resuming_ = false;
   bool goal_active_{false};
-  bool stopped_{false};
-  bool last_robot_pose_valid_{false};
-  geometry_msgs::msg::Point last_robot_pose_;
-  rclcpp::Time last_robot_movement_time_;
   rclcpp_action::GoalUUID active_goal_id_;
 };
 }  // namespace explore

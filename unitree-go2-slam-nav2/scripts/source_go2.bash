@@ -1,38 +1,14 @@
 #!/usr/bin/env bash
 # Source the GO2 SLAM stack with workspace verification.
-# Usage: source ws/source_go2.bash
-# Override: GO2_WS=~/GO2_RTABNAV2/ws  GO2_ROS_DISTRO=foxy|jazzy
+# Usage: source scripts/source_go2.bash
+# Override: GO2_WS=~/GO2_RTABNAV2/ws
 
 _GO2_WS="${GO2_WS:-${HOME}/GO2_RTABNAV2/ws}"
 _GO2_WS="$(cd "${_GO2_WS}" && pwd)"
 _GO2_EXPECTED="${_GO2_WS}/install/go2_slam_nav"
 
-# Auto-detect ROS distro (Foxy on this machine; Jazzy on dev hosts).
-if [[ -z "${GO2_ROS_DISTRO:-}" ]]; then
-  if [[ -f /opt/ros/foxy/setup.bash ]]; then
-    GO2_ROS_DISTRO=foxy
-  elif [[ -f /opt/ros/jazzy/setup.bash ]]; then
-    GO2_ROS_DISTRO=jazzy
-  else
-    GO2_ROS_DISTRO="${ROS_DISTRO:-foxy}"
-  fi
-fi
-export GO2_ROS_DISTRO
-
-# Unitree ROS2 overlay (cyclonedds_ws or install layout).
-if [[ -z "${GO2_UNITREE_SETUP:-}" ]]; then
-  for _candidate in \
-    "${HOME}/unitree_ros2/install/setup.bash" \
-    "${HOME}/unitree_ros2/cyclonedds_ws/install/setup.bash" \
-    "${HOME}/cyclonedds_ws/install/setup.bash"; do
-    if [[ -f "${_candidate}" ]]; then
-      GO2_UNITREE_SETUP="${_candidate}"
-      break
-    fi
-  done
-fi
-
-export PATH="/usr/bin:/bin:/opt/ros/${GO2_ROS_DISTRO}/bin:${PATH}"
+# Prefer system ROS binaries over ~/.local shims.
+export PATH="/usr/bin:/bin:/opt/ros/jazzy/bin:${PATH}"
 
 _fail() {
   echo "source_go2.bash: $*" >&2
@@ -93,18 +69,12 @@ _strip_prefix_path() {
   fi
 }
 
-[[ -f "/opt/ros/${GO2_ROS_DISTRO}/setup.bash" ]] || \
-  _fail "ROS ${GO2_ROS_DISTRO} not found at /opt/ros/${GO2_ROS_DISTRO}"
-
 set +u
 # shellcheck disable=SC1091
-source "/opt/ros/${GO2_ROS_DISTRO}/setup.bash"
-if [[ -n "${GO2_UNITREE_SETUP:-}" && -f "${GO2_UNITREE_SETUP}" ]]; then
-  # shellcheck disable=SC1090
-  source "${GO2_UNITREE_SETUP}"
-else
-  echo "source_go2.bash: warning: unitree_ros2 setup not found — GO2 topics may be missing" >&2
-fi
+source /opt/ros/jazzy/setup.bash
+# shellcheck disable=SC1091
+source "${HOME}/unitree_ros2/cyclonedds_ws/install/setup.bash"
+# Remove stale go2_slam_nav_ws overlay; keep ROS Jazzy + unitree in the path.
 _strip_prefix_path CMAKE_PREFIX_PATH "${HOME}/go2_slam_nav_ws"
 _strip_prefix_path AMENT_PREFIX_PATH "${HOME}/go2_slam_nav_ws"
 _strip_prefix_path COLCON_PREFIX_PATH "${HOME}/go2_slam_nav_ws"
@@ -128,7 +98,7 @@ fi
 
 _pkg_prefix="$(ros2 pkg prefix go2_slam_nav 2>/dev/null)" || _pkg_prefix=""
 if [[ -z "${_pkg_prefix}" ]]; then
-  _fail "ros2 pkg prefix go2_slam_nav failed — rebuild: cd ${_GO2_WS} && colcon build --symlink-install"
+  _fail "ros2 pkg prefix go2_slam_nav failed — is ROS Jazzy sourced?"
 fi
 if [[ "${_pkg_prefix}" != "${_GO2_EXPECTED}" ]]; then
   _fail "go2_slam_nav resolves to '${_pkg_prefix}', expected '${_GO2_EXPECTED}' (check ~/go2_slam_nav_ws overlay)"
@@ -140,8 +110,8 @@ fi
 
 _rtabmap_prefix="$(ros2 pkg prefix rtabmap_slam 2>/dev/null)" || _rtabmap_prefix=""
 if [[ -z "${_rtabmap_prefix}" ]]; then
-  _fail "rtabmap_slam not found — run: sudo apt install ros-${GO2_ROS_DISTRO}-rtabmap-ros"
+  _fail "rtabmap_slam not found — run: sudo apt install ros-jazzy-rtabmap-ros"
 fi
 
-echo "==> GO2 workspace ready: ${_GO2_WS}  (ROS ${GO2_ROS_DISTRO})"
+echo "==> GO2 workspace ready: ${_GO2_WS}"
 echo "==> go2_slam_nav: ${_pkg_prefix}"

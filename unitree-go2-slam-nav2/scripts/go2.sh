@@ -12,8 +12,7 @@
 #   GO2_WS=~/huang_grok/ws          Workspace overlay path
 #   GO2_ROBOT_IFACE=enx00e04c123598  Unitree Ethernet interface (auto-detected if unset)
 #   GO2_SKIP_KILL=1                  Skip killing stale ROS nodes before launch
-#   GO2_CLOUD_MODE=deskewed          Use /utlidar/cloud_deskewed (default, motion-compensated)
-#   GO2_CLOUD_MODE=base              Fallback: /utlidar/cloud_base passthrough
+#   GO2_CLOUD_MODE=base              Use /utlidar/cloud_base passthrough (fallback)
 
 set -euo pipefail
 
@@ -22,30 +21,9 @@ MODE=""
 DB_ARG=""
 FRESH_MAP="false"
 
-if [[ -z "${GO2_ROS_DISTRO:-}" ]]; then
-  if [[ -f /opt/ros/foxy/setup.bash ]]; then
-    GO2_ROS_DISTRO=foxy
-  elif [[ -f /opt/ros/jazzy/setup.bash ]]; then
-    GO2_ROS_DISTRO=jazzy
-  else
-    GO2_ROS_DISTRO="${ROS_DISTRO:-foxy}"
-  fi
-fi
-export GO2_ROS_DISTRO
-GO2_WS="${GO2_WS:-${SCRIPT_DIR}/../../ws}"
+GO2_ROS_DISTRO="${GO2_ROS_DISTRO:-jazzy}"
+GO2_WS="${GO2_WS:-${HOME}/huang_grok/ws}"
 GO2_WS="$(cd "${GO2_WS}" && pwd)"
-if [[ -z "${GO2_UNITREE_SETUP:-}" ]]; then
-  for _u in \
-    "${HOME}/unitree_ros2/install/setup.bash" \
-    "${HOME}/unitree_ros2/cyclonedds_ws/install/setup.bash" \
-    "${HOME}/cyclonedds_ws/install/setup.bash"; do
-    if [[ -f "${_u}" ]]; then
-      GO2_UNITREE_SETUP="${_u}"
-      break
-    fi
-  done
-fi
-export GO2_UNITREE_SETUP="${GO2_UNITREE_SETUP:-}"
 
 usage() {
   sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'

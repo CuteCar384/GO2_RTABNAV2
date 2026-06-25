@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """订阅 Nav2 / explore_lite 状态，用中文输出导航/探索进度日志。"""
 
-import time
-
 import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
-from geometry_msgs.msg import Twist
 from rclpy.logging import LoggingSeverity
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -23,14 +20,8 @@ _GOAL_STATUS_CN = {
     GoalStatus.STATUS_CANCELING: '取消中',
     GoalStatus.STATUS_SUCCEEDED: '成功',
     GoalStatus.STATUS_CANCELED: '已取消',
-    GoalStatus.STATUS_ABORTED: '中断',
+    GoalStatus.STATUS_ABORTED: '失败',
 }
-
-_ACTIVE_STATUSES = (
-    GoalStatus.STATUS_EXECUTING,
-    GoalStatus.STATUS_ACCEPTED,
-    GoalStatus.STATUS_CANCELING,
-)
 
 _EXPLORE_STATUS_CN = {
     'exploration_started': '探索已开始',
@@ -47,34 +38,23 @@ class NavProgressMonitor(Node):
         super().__init__('nav_progress_monitor')
         self.declare_parameter('slam_mode', 'mapping')
         self.declare_parameter('heartbeat_sec', 15.0)
-        self.declare_parameter('aborted_warn_sec', 8.0)
         self.declare_parameter('nav_action_status_topic', '/navigate_to_pose/_action/status')
         self.declare_parameter('nav_action_feedback_topic', '/navigate_to_pose/_action/feedback')
         self.declare_parameter('explore_status_topic', '/explore/status')
-        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
-        self.declare_parameter('cmd_vel_stale_sec', 12.0)
 
         slam_mode = str(self.get_parameter('slam_mode').value).strip().lower()
         self._mode_label = _MODE_LABELS.get(slam_mode, slam_mode or '建图')
         self._heartbeat_sec = max(5.0, float(self.get_parameter('heartbeat_sec').value))
-        self._aborted_warn_sec = max(2.0, float(self.get_parameter('aborted_warn_sec').value))
         self._nav_status_topic = str(self.get_parameter('nav_action_status_topic').value)
         self._explore_topic = str(self.get_parameter('explore_status_topic').value)
 
         self._goal_status = GoalStatus.STATUS_UNKNOWN
-        self._active_goal_id = None
         self._distance_remaining = -1.0
         self._explore_status = ''
         self._last_explore_status = ''
         self._nav_ready = False
         self._status_count = 0
         self._nav_client = None
-        self._recovery_pending = False
-        self._abort_warn_timer = None
-        self._cmd_vel_topic = str(self.get_parameter('cmd_vel_topic').value)
-        self._cmd_vel_stale_sec = max(3.0, float(self.get_parameter('cmd_vel_stale_sec').value))
-        self._last_cmd_vel_mono = 0.0
-        self._last_cmd_vel_nonzero = False
 
         self.get_logger().set_level(LoggingSeverity.INFO)
 
@@ -119,10 +99,6 @@ class NavProgressMonitor(Node):
         except Exception:
             self._nav_client = None
 
-        self.create_subscription(
-            Twist, self._cmd_vel_topic, self._on_cmd_vel, status_qos,
-        )
-
         self.create_timer(self._heartbeat_sec, self._heartbeat)
         self.get_logger().info(
             f'[任务进度] 导航监控已启动，模式={self._mode_label}，'
@@ -137,124 +113,53 @@ class NavProgressMonitor(Node):
         except Exception:
             return None
 
-    @staticmethod
-    def _goal_id(entry) -> tuple:
-        goal_info = getattr(entry, 'goal_info', None)
-        if goal_info is None:
-            return ()
-        goal_id = getattr(goal_info, 'goal_id', None)
-        if goal_id is None:
-            return ()
-        uuid = getattr(goal_id, 'uuid', None)
-        if uuid is None:
-            return ()
-        return tuple(uuid)
-
-    def _pick_active_status(self, status_list):
-        """Prefer running goals; stale ABORTED entries stay in the action status array."""
-        executing = None
-        accepted = None
-        for entry in status_list:
-            status = int(entry.status)
-            if status == GoalStatus.STATUS_EXECUTING:
-                executing = entry
-            elif status == GoalStatus.STATUS_ACCEPTED and accepted is None:
-                accepted = entry
-        if executing is not None:
-            return executing
-        if accepted is not None:
-            return accepted
-        return status_list[-1]
-
-    def _cancel_abort_warn_timer(self) -> None:
-        if self._abort_warn_timer is not None:
-            self._abort_warn_timer.cancel()
-            self._abort_warn_timer.destroy()
-            self._abort_warn_timer = None
-
-    def _schedule_abort_warn(self) -> None:
-        self._cancel_abort_warn_timer()
-        self._abort_warn_timer = self.create_timer(
-            self._aborted_warn_sec, self._on_abort_warn_timeout)
-
-    def _on_abort_warn_timeout(self) -> None:
-        self._cancel_abort_warn_timer()
-        if self._goal_status != GoalStatus.STATUS_ABORTED:
-            return
-        self.get_logger().warn(
-            f'[任务进度] 模式={self._mode_label} | 导航阶段=失败 | '
-            f'目标在 {self._aborted_warn_sec:.0f}s 内未恢复。'
-            '可能原因：规划失败、被障碍阻挡或控制器超时；'
-            'Nav2 将换目标或等待 explore_lite 重试。'
-        )
-
     def _on_nav_status(self, msg: GoalStatusArray) -> None:
         self._status_count += 1
         self._nav_ready = True
         if not msg.status_list:
             if self._goal_status != GoalStatus.STATUS_UNKNOWN:
                 self._goal_status = GoalStatus.STATUS_UNKNOWN
-                self._active_goal_id = None
-                self._recovery_pending = False
-                self._cancel_abort_warn_timer()
                 self.get_logger().info(
                     f'[任务进度] 模式={self._mode_label} | 导航阶段=空闲 | '
                     'Nav2 就绪，等待导航目标。'
                 )
             return
 
-        active = self._pick_active_status(msg.status_list)
-        new_status = int(active.status)
-        new_goal_id = self._goal_id(active)
-        if new_status == self._goal_status and new_goal_id == self._active_goal_id:
+        latest = msg.status_list[-1]
+        new_status = int(latest.status)
+        if new_status == self._goal_status:
             return
 
-        old_status = self._goal_status
-        old_cn = _GOAL_STATUS_CN.get(old_status, str(old_status))
+        old_cn = _GOAL_STATUS_CN.get(self._goal_status, str(self._goal_status))
         new_cn = _GOAL_STATUS_CN.get(new_status, str(new_status))
         self._goal_status = new_status
-        self._active_goal_id = new_goal_id
 
         if new_status == GoalStatus.STATUS_EXECUTING:
-            self._cancel_abort_warn_timer()
-            if self._recovery_pending:
-                self._recovery_pending = False
-                self.get_logger().info(
-                    f'[任务进度] 模式={self._mode_label} | 导航阶段=跟路径 | '
-                    'Nav2 恢复后继续向目标点移动。'
-                )
-            else:
-                self.get_logger().info(
-                    f'[任务进度] 模式={self._mode_label} | 导航阶段=跟路径 | '
-                    f'目标状态={new_cn}，正在向目标点移动。'
-                )
+            self.get_logger().info(
+                f'[任务进度] 模式={self._mode_label} | 导航阶段=跟路径 | '
+                f'目标状态={new_cn}，正在向目标点移动。'
+            )
         elif new_status == GoalStatus.STATUS_SUCCEEDED:
-            self._recovery_pending = False
-            self._cancel_abort_warn_timer()
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段=到达 | '
                 f'目标状态={new_cn}，本段导航完成。'
             )
             self._distance_remaining = -1.0
         elif new_status == GoalStatus.STATUS_ABORTED:
-            # BT recovery aborts follow_path/plan briefly; not a terminal failure.
-            self._recovery_pending = True
-            self._distance_remaining = -1.0
-            self._schedule_abort_warn()
-            self.get_logger().info(
-                f'[任务进度] 模式={self._mode_label} | 导航阶段=恢复中 | '
-                f'本段路径受阻（{old_cn}→{new_cn}），Nav2 正在 spin/wait 重试。'
+            self.get_logger().warn(
+                f'[任务进度] 模式={self._mode_label} | 导航阶段=失败 | '
+                f'目标状态={new_cn}（原 {old_cn}）。'
+                '可能原因：规划失败、被障碍阻挡或控制器超时；'
+                'Nav2 将按行为树尝试恢复（spin/wait，GO2 无倒车）。'
             )
+            self._distance_remaining = -1.0
         elif new_status == GoalStatus.STATUS_CANCELED:
-            self._recovery_pending = False
-            self._cancel_abort_warn_timer()
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段=取消 | '
                 f'目标状态={new_cn}。'
             )
             self._distance_remaining = -1.0
         elif new_status == GoalStatus.STATUS_ACCEPTED:
-            self._cancel_abort_warn_timer()
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 导航阶段=规划 | '
                 f'目标状态={new_cn}，全局路径计算中。'
@@ -264,21 +169,6 @@ class NavProgressMonitor(Node):
                 f'[任务进度] 模式={self._mode_label} | 导航阶段=更新 | '
                 f'目标状态 {old_cn} → {new_cn}。'
             )
-
-    def _on_cmd_vel(self, msg: Twist) -> None:
-        moving = (
-            abs(msg.linear.x) > 0.02
-            or abs(msg.linear.y) > 0.02
-            or abs(msg.angular.z) > 0.05
-        )
-        if moving:
-            self._last_cmd_vel_mono = time.monotonic()
-            self._last_cmd_vel_nonzero = True
-
-    def _cmd_vel_stale(self) -> bool:
-        if not self._last_cmd_vel_nonzero:
-            return False
-        return (time.monotonic() - self._last_cmd_vel_mono) > self._cmd_vel_stale_sec
 
     def _on_nav_feedback(self, msg) -> None:
         feedback = msg.feedback
@@ -308,7 +198,7 @@ class NavProgressMonitor(Node):
         if self._goal_status in (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED):
             return '空闲'
         if self._goal_status == GoalStatus.STATUS_ABORTED:
-            return '恢复中' if self._recovery_pending else '失败'
+            return '失败待恢复'
         return '空闲'
 
     def _nav2_server_available(self) -> bool:
@@ -336,24 +226,10 @@ class NavProgressMonitor(Node):
             dist_part = f'剩余约 {self._distance_remaining:.2f}m，'
 
         if self._goal_status == GoalStatus.STATUS_EXECUTING:
-            if self._cmd_vel_stale():
-                self.get_logger().warn(
-                    f'[任务进度] 模式={self._mode_label} | 导航阶段=卡住(虚进) | '
-                    f'{explore_part}{dist_part}'
-                    f'Nav2 显示执行中但 >{self._cmd_vel_stale_sec:.0f}s 无 cmd_vel；'
-                    'explore 将在约 12s 无 odom 位移后取消并换点。'
-                )
-            else:
-                self.get_logger().info(
-                    f'[任务进度] 模式={self._mode_label} | 导航阶段={self._nav_phase_cn()} | '
-                    f'{explore_part}{dist_part}'
-                    f'代价地图=/map_obstacles + /go2/cloud。'
-                )
-        elif self._goal_status == GoalStatus.STATUS_ABORTED and self._recovery_pending:
             self.get_logger().info(
-                f'[任务进度] 模式={self._mode_label} | 导航阶段=恢复中 | '
-                f'{explore_part}'
-                'Nav2 正在脱困重试（spin/wait），尚未终止本目标。'
+                f'[任务进度] 模式={self._mode_label} | 导航阶段={self._nav_phase_cn()} | '
+                f'{explore_part}{dist_part}'
+                f'代价地图=/map_obstacles + /go2/cloud。'
             )
         elif self._goal_status in (GoalStatus.STATUS_UNKNOWN, GoalStatus.STATUS_SUCCEEDED,
                                    GoalStatus.STATUS_CANCELED):

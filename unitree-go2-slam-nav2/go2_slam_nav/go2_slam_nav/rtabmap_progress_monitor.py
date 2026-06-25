@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """订阅 /rtabmap/info，用中文输出建图/定位/回环进度日志。"""
 
-from typing import List
-
 import rclpy
 from rclpy.logging import LoggingSeverity
 from rclpy.node import Node
@@ -140,7 +138,7 @@ class RtabmapProgressMonitor(Node):
         if ref_id != self._last_ref_id and ref_id >= 0:
             self._last_ref_id = ref_id
 
-    def _info_topics(self) -> List[str]:
+    def _info_topics(self) -> list[str]:
         topics = [self._info_topic]
         if self._info_topic_fallback and self._info_topic_fallback not in topics:
             topics.append(self._info_topic_fallback)

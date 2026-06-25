@@ -197,14 +197,8 @@ void Costmap2DClient::updatePartialMap(
   size_t costmap_xn = costmap_.getSizeInCellsX();
   size_t costmap_yn = costmap_.getSizeInCellsY();
 
-  if (xn > costmap_xn || yn > costmap_yn) {
-    RCLCPP_DEBUG(node_.get_logger(),
-                 "map update exceeds current costmap size "
-                 "([%lu, %lu] vs [%lu, %lu]); waiting for full map",
-                 xn, yn, costmap_xn, costmap_yn);
-    return;
-  }
-  if (x0 > costmap_xn || y0 > costmap_yn) {
+  if (xn > costmap_xn || x0 > costmap_xn || yn > costmap_yn ||
+      y0 > costmap_yn) {
     RCLCPP_WARN(node_.get_logger(),
                 "received update doesn't fully fit into existing map, "
                 "only part will be copied. received: [%lu, %lu], [%lu, %lu] "
@@ -227,21 +221,17 @@ void Costmap2DClient::updatePartialMap(
 
 geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
 {
+  geometry_msgs::msg::PoseStamped robot_pose;
   geometry_msgs::msg::Pose empty_pose;
+  robot_pose.header.frame_id = robot_base_frame_;
+  robot_pose.header.stamp = node_.now();
+
   auto& clk = *node_.get_clock();
 
-  // Use latest TF (TimePointZero). RTAB-Map map->odom updates lag wall time;
-  // querying at node_.now() causes "extrapolation into the future" on GO2.
+  // get the global pose of the robot
   try {
-    const auto tf_stamped = tf_->lookupTransform(
-        global_frame_, robot_base_frame_, tf2::TimePointZero,
-        tf2::durationFromSec(transform_tolerance_));
-    geometry_msgs::msg::Pose pose;
-    pose.position.x = tf_stamped.transform.translation.x;
-    pose.position.y = tf_stamped.transform.translation.y;
-    pose.position.z = tf_stamped.transform.translation.z;
-    pose.orientation = tf_stamped.transform.rotation;
-    return pose;
+    robot_pose = tf_->transform(robot_pose, global_frame_,
+                                tf2::durationFromSec(transform_tolerance_));
   } catch (tf2::LookupException& ex) {
     RCLCPP_ERROR_THROTTLE(node_.get_logger(), clk, 1000,
                           "No Transform available Error looking up robot pose: "
@@ -263,6 +253,8 @@ geometry_msgs::msg::Pose Costmap2DClient::getRobotPose() const
                           ex.what());
     return empty_pose;
   }
+
+  return robot_pose.pose;
 }
 
 std::array<unsigned char, 256> init_translation_table()

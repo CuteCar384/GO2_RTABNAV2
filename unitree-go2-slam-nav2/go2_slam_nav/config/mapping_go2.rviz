@@ -3,6 +3,10 @@ Panels:
     Name: Displays
   - Class: rviz_common/Views
     Name: Views
+  - Class: rviz_common/Time
+    Name: Time
+    SyncMode: 0
+    SyncSource: CloudMap
 Visualization Manager:
   Class: ""
   Displays:
