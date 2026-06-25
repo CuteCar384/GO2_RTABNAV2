@@ -8,7 +8,9 @@
     costmap_topic: /map_obstacles
     costmap_updates_topic: /map_obstacles_updates
     visualize: true
-    planner_frequency: 2.0
+    planner_frequency: 1.0
+    goal_tolerance: 0.35
+    min_goal_interval: 3.0
     progress_timeout: 15.0
     robot_progress_timeout: 8.0
     robot_progress_radius: 0.25

@@ -50,6 +50,15 @@ inline static bool same_point(const geometry_msgs::msg::Point& one,
   return dist < 0.01;
 }
 
+inline static bool goals_near(const geometry_msgs::msg::Point& one,
+                              const geometry_msgs::msg::Point& two,
+                              double tolerance)
+{
+  double dx = one.x - two.x;
+  double dy = one.y - two.y;
+  return std::hypot(dx, dy) < tolerance;
+}
+
 namespace explore
 {
 Explore::Explore()
@@ -72,6 +81,8 @@ Explore::Explore()
   this->declare_parameter<float>("cmd_vel_angular_threshold", 0.05);
   this->declare_parameter<std::string>("progress_odom_frame", "go2_odom");
   this->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
+  this->declare_parameter<float>("goal_tolerance", 0.35);
+  this->declare_parameter<float>("min_goal_interval", 3.0);
   this->declare_parameter<bool>("visualize", false);
   this->declare_parameter<float>("potential_scale", 1e-3);
   this->declare_parameter<float>("orientation_scale", 0.0);
@@ -87,6 +98,8 @@ Explore::Explore()
   this->get_parameter("cmd_vel_linear_threshold", cmd_vel_linear_threshold_);
   this->get_parameter("cmd_vel_angular_threshold", cmd_vel_angular_threshold_);
   this->get_parameter("cmd_vel_topic", cmd_vel_topic_);
+  this->get_parameter("goal_tolerance", goal_tolerance_);
+  this->get_parameter("min_goal_interval", min_goal_interval_);
   this->get_parameter("visualize", visualize_);
   this->get_parameter("potential_scale", potential_scale_);
   this->get_parameter("orientation_scale", orientation_scale_);
@@ -131,12 +144,12 @@ Explore::Explore()
       cmd_vel_topic_, 10,
       std::bind(&Explore::cmdVelCallback, this, std::placeholders::_1));
 
-  RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
+  RCLCPP_INFO(logger_, "等待连接 Nav2 navigate_to_pose 服务...");
   move_base_client_->wait_for_action_server();
-  RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
+  RCLCPP_INFO(logger_, "已连接 Nav2 navigate_to_pose 服务");
 
   if (return_to_init_) {
-    RCLCPP_INFO(logger_, "Getting initial pose of the robot");
+    RCLCPP_INFO(logger_, "获取机器人初始位姿...");
     geometry_msgs::msg::TransformStamped transformStamped;
     std::string map_frame = costmap_client_.getGlobalFrameID();
     try {
@@ -146,7 +159,7 @@ Explore::Explore()
       initial_pose_.position.y = transformStamped.transform.translation.y;
       initial_pose_.orientation = transformStamped.transform.rotation;
     } catch (tf2::TransformException& ex) {
-      RCLCPP_ERROR(logger_, "Couldn't find transform from %s to %s: %s",
+      RCLCPP_ERROR(logger_, "无法查询 TF %s -> %s: %s",
                    map_frame.c_str(), robot_base_frame_.c_str(), ex.what());
       return_to_init_ = false;
     }
@@ -293,7 +306,7 @@ bool Explore::updateRobotProgress()
 
 bool Explore::robotStuck() const
 {
-  if (!goal_active_ || !last_robot_pose_valid_) {
+  if (!pursuit_active_ || !last_robot_pose_valid_) {
     return false;
   }
   return (this->now() - last_robot_movement_time_) >
@@ -314,7 +327,7 @@ void Explore::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
 
 bool Explore::cmdVelStale() const
 {
-  if (!goal_active_) {
+  if (!pursuit_active_) {
     return false;
   }
   const auto stale_for = [&](const rclcpp::Time& since) {
@@ -351,6 +364,7 @@ void Explore::publishExploreStatus(const std::string& status, size_t frontiers_f
   msg.frontiers_found = static_cast<uint32_t>(last_frontiers_found_);
   msg.frontiers_available = static_cast<uint32_t>(last_frontiers_available_);
   status_pub_->publish(msg);
+  last_status_publish_time_ = this->now();
 }
 
 void Explore::cancelStuckGoal(const std::string& reason)
@@ -358,13 +372,12 @@ void Explore::cancelStuckGoal(const std::string& reason)
   frontier_blacklist_.push_back(prev_goal_);
   RCLCPP_WARN(
       logger_,
-      "%s — blacklisted (%.2f, %.2f), total blacklist=%zu, available=%zu/%zu",
+      "%s — 已拉黑 (%.2f, %.2f)，累计拉黑 %zu 点，可用前沿 %zu/%zu",
       reason.c_str(), prev_goal_.x, prev_goal_.y, frontier_blacklist_.size(),
       last_frontiers_available_, last_frontiers_found_);
   goal_active_ = false;
+  pursuit_active_ = false;
   move_base_client_->async_cancel_all_goals();
-  last_robot_movement_time_ = this->now();
-  last_cmd_vel_time_ = this->now();
   publishExploreStatus(
       explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS);
 }
@@ -376,17 +389,17 @@ void Explore::makePlan()
   // Progress uses odom frame — immune to RTAB-Map map->odom loop jumps.
   updateRobotProgress();
 
-  if (goal_active_ && cmdVelStale()) {
+  if (pursuit_active_ && cmdVelStale()) {
     cancelStuckGoal(
-        "No cmd_vel for " + std::to_string(static_cast<int>(cmd_vel_stale_timeout_)) +
-        "s with active Nav2 goal");
+        std::to_string(static_cast<int>(cmd_vel_stale_timeout_)) +
+        "s 无 cmd_vel，追击中卡住");
     return;
   }
 
-  if (goal_active_ && robotStuck()) {
+  if (pursuit_active_ && robotStuck()) {
     cancelStuckGoal(
-        "Robot stuck for " + std::to_string(static_cast<int>(robot_progress_timeout_)) +
-        "s (odom) with active Nav2 goal");
+        "odom " + std::to_string(static_cast<int>(robot_progress_timeout_)) +
+        "s 无位移，追击中卡住");
     return;
   }
 
@@ -402,7 +415,7 @@ void Explore::makePlan()
     // moves and the occupancy grid updates. Keep polling instead of stopping.
     RCLCPP_WARN_THROTTLE(
         logger_, *this->get_clock(), 5000,
-        "No frontiers found, waiting for map update...");
+        "未找到前沿，等待地图更新...");
     return;
   }
 
@@ -422,7 +435,7 @@ void Explore::makePlan()
 
   if (frontier == frontiers.end()) {
     RCLCPP_WARN(logger_,
-                "All frontiers traversed/tried out (blacklist=%zu), stopping.",
+                "所有前沿已尝试完毕（拉黑 %zu 点），探索结束。",
                 frontier_blacklist_.size());
     publishExploreStatus(
         explore_lite_msgs::msg::ExploreStatus::EXPLORATION_COMPLETE,
@@ -433,25 +446,25 @@ void Explore::makePlan()
   geometry_msgs::msg::Point target_position = frontier->centroid;
 
   // time out if we are not making any progress
-  bool same_goal = same_point(prev_goal_, target_position);
+  const bool same_goal =
+      goals_near(prev_goal_, target_position, goal_tolerance_);
 
-  prev_goal_ = target_position;
   // Blacklist if the robot itself has not moved in odom (not Nav2 feedback).
-  if (goal_active_ &&
+  if (pursuit_active_ &&
       (this->now() - last_progress_ >
        tf2::durationFromSec(progress_timeout_)) &&
       !resuming_) {
     frontier_blacklist_.push_back(target_position);
     RCLCPP_WARN(
         logger_,
-        "No odom motion for %.0fs — blacklisted (%.2f, %.2f), total "
-        "blacklist=%zu, available=%zu/%zu",
+        "odom %.0fs 无位移 — 已拉黑 (%.2f, %.2f)，累计拉黑 %zu 点，可用前沿 %zu/%zu",
         progress_timeout_, target_position.x, target_position.y,
         frontier_blacklist_.size(), last_frontiers_available_ - 1,
         last_frontiers_found_);
     goal_active_ = false;
+    pursuit_active_ = false;
+    prev_goal_ = target_position;
     move_base_client_->async_cancel_all_goals();
-    last_robot_movement_time_ = this->now();
     last_frontiers_available_ =
         last_frontiers_available_ > 0 ? last_frontiers_available_ - 1 : 0;
     publishExploreStatus(
@@ -464,21 +477,34 @@ void Explore::makePlan()
     resuming_ = false;
   }
 
-  // we don't need to do anything if we still pursuing the same goal
-  if (same_goal && goal_active_) {
-    publishExploreStatus(
-        explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS);
-    RCLCPP_INFO_THROTTLE(
-        logger_, *this->get_clock(), 5000,
-        "Pursuing frontier (%.2f, %.2f) | blacklist=%zu | available=%zu/%zu",
-        target_position.x, target_position.y, frontier_blacklist_.size(),
-        last_frontiers_available_, last_frontiers_found_);
-    return;
+  if (pursuit_active_) {
+    if (same_goal) {
+      if ((this->now() - last_status_publish_time_) >
+          tf2::durationFromSec(2.0)) {
+        publishExploreStatus(
+            explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS);
+        last_status_publish_time_ = this->now();
+      }
+      RCLCPP_INFO_THROTTLE(
+          logger_, *this->get_clock(), 5000,
+          "追击中 (%.2f, %.2f) | 已拉黑 %zu 点 | 可用前沿 %zu/%zu",
+          prev_goal_.x, prev_goal_.y, frontier_blacklist_.size(),
+          last_frontiers_available_, last_frontiers_found_);
+      return;
+    }
+    if ((this->now() - last_goal_sent_time_) <
+        tf2::durationFromSec(min_goal_interval_)) {
+      RCLCPP_DEBUG_THROTTLE(
+          logger_, *this->get_clock(), 5000,
+          "抑制重发目标 %.1fs（前沿地图抖动）",
+          min_goal_interval_);
+      return;
+    }
   }
 
   RCLCPP_INFO(
       logger_,
-      "New frontier goal (%.2f, %.2f) | blacklist=%zu | available=%zu/%zu",
+      "新前沿目标 (%.2f, %.2f) | 已拉黑 %zu 点 | 可用前沿 %zu/%zu",
       target_position.x, target_position.y, frontier_blacklist_.size(),
       last_frontiers_available_, last_frontiers_found_);
   RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
@@ -490,16 +516,21 @@ void Explore::makePlan()
   goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
   goal.pose.header.stamp = this->now();
 
+  prev_goal_ = target_position;
+  const bool new_pursuit = !pursuit_active_;
   goal_active_ = true;
-  goal_start_time_ = this->now();
-  geometry_msgs::msg::Point odom_pos;
-  if (lookupOdomPosition(odom_pos)) {
-    last_robot_pose_ = odom_pos;
-    last_robot_pose_valid_ = true;
+  pursuit_active_ = true;
+  last_goal_sent_time_ = this->now();
+  if (new_pursuit) {
+    goal_start_time_ = this->now();
+    geometry_msgs::msg::Point odom_pos;
+    if (lookupOdomPosition(odom_pos)) {
+      last_robot_pose_ = odom_pos;
+      last_robot_pose_valid_ = true;
+      last_robot_movement_time_ = this->now();
+      last_progress_ = this->now();
+    }
   }
-  last_robot_movement_time_ = this->now();
-  last_cmd_vel_time_ = this->now();
-  last_progress_ = this->now();
 
   publishExploreStatus(
       explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS,
@@ -513,8 +544,9 @@ void Explore::makePlan()
       [this](std::shared_future<NavigationGoalHandle::SharedPtr> future) {
         auto goal_handle = future.get();
         if (!goal_handle) {
-          RCLCPP_ERROR(logger_, "Goal was REJECTED by the action server");
+          RCLCPP_ERROR(logger_, "Nav2 拒绝了导航目标");
           goal_active_ = false;
+          pursuit_active_ = false;
         } else {
           active_goal_id_ = goal_handle->get_goal_id();
           RCLCPP_DEBUG(logger_, "Goal ACCEPTED, uuid: %s",
@@ -525,8 +557,9 @@ void Explore::makePlan()
   send_goal_options.goal_response_callback =
       [this](const NavigationGoalHandle::SharedPtr& goal_handle) {
         if (!goal_handle) {
-          RCLCPP_ERROR(logger_, "Goal was REJECTED by the action server");
+          RCLCPP_ERROR(logger_, "Nav2 拒绝了导航目标");
           goal_active_ = false;
+          pursuit_active_ = false;
         } else {
           active_goal_id_ = goal_handle->get_goal_id();
           RCLCPP_DEBUG(logger_, "Goal ACCEPTED, uuid: %s",
@@ -545,7 +578,7 @@ void Explore::makePlan()
 
 void Explore::returnToInitialPose()
 {
-  RCLCPP_INFO(logger_, "Returning to initial pose.");
+  RCLCPP_INFO(logger_, "返回探索起点...");
   publishExploreStatus(
       explore_lite_msgs::msg::ExploreStatus::RETURNING_TO_ORIGIN);
 
@@ -562,7 +595,7 @@ void Explore::returnToInitialPose()
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
           publishExploreStatus(
               explore_lite_msgs::msg::ExploreStatus::RETURNED_TO_ORIGIN);
-          RCLCPP_INFO(logger_, "Successfully returned to initial pose.");
+          RCLCPP_INFO(logger_, "已返回探索起点。");
         }
       };
   move_base_client_->async_send_goal(goal, send_goal_options);
@@ -595,6 +628,7 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
       RCLCPP_DEBUG(logger_, "Goal was successful");
+      pursuit_active_ = false;
       last_progress_ = this->now();
       prev_distance_ = 0;
       break;
@@ -617,7 +651,7 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       RCLCPP_DEBUG(logger_, "Goal was canceled");
       return;
     default:
-      RCLCPP_WARN(logger_, "Unknown result code from move base nav2");
+      RCLCPP_WARN(logger_, "Nav2 返回未知结果码");
       break;
   }
   // find new goal immediately regardless of planning frequency.
@@ -635,17 +669,18 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
 
 void Explore::start()
 {
-  RCLCPP_INFO(logger_, "Exploration started.");
+  RCLCPP_INFO(logger_, "探索已开始。");
   publishExploreStatus(
       explore_lite_msgs::msg::ExploreStatus::EXPLORATION_STARTED, 0, 0, false);
 }
 
 void Explore::stop(bool finished_exploring)
 {
-  RCLCPP_INFO(logger_, "Exploration stopped.");
+  RCLCPP_INFO(logger_, "探索已停止。");
 
   stopped_ = true;
   goal_active_ = false;
+  pursuit_active_ = false;
   // Only publish paused status if manually stopped (not finished exploring)
   if (!finished_exploring) {
     publishExploreStatus(
@@ -664,7 +699,7 @@ void Explore::resume()
 {
   stopped_ = false;
   resuming_ = true;
-  RCLCPP_INFO(logger_, "Exploration resuming.");
+  RCLCPP_INFO(logger_, "探索已恢复。");
   publishExploreStatus(
       explore_lite_msgs::msg::ExploreStatus::EXPLORATION_IN_PROGRESS);
   // Reactivate the timer

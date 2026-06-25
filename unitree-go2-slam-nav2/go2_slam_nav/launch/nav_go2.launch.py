@@ -20,6 +20,9 @@
 # Kill stale nodes first:
 #   pgrep -f 'rtabmap|nav2_|sport_ctrl|sensor_stamp_relay|go2_tf_relay|obstacle_grid' | xargs -r kill -9
 
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -27,8 +30,14 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+from go2_slam_nav._ros_distro import nav2_params_basename
+
 
 def generate_launch_description():
+    nav2_params = os.path.join(
+        get_package_share_directory('go2_slam_nav'),
+        'config', nav2_params_basename(),
+    )
     return LaunchDescription([
         DeclareLaunchArgument('use_rviz', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument(
@@ -99,9 +108,10 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'log_level': LaunchConfiguration('log_level'),
-                'min_linear_speed': 0.3,
-                'min_lateral_speed': 0.15,
-                'min_angular_speed': 0.3,
+                'min_linear_speed': 0.15,
+                'min_lateral_speed': 0.0,
+                'allow_lateral': False,
+                'min_angular_speed': 0.15,
             }],
         ),
 
@@ -117,7 +127,7 @@ def generate_launch_description():
                     parameters=[{
                         'slam_mode': LaunchConfiguration('slam_mode'),
                         'heartbeat_sec': 8.0,
-                        'stuck_heartbeat_sec': 4.0,
+                        'frontier_stats_log_sec': 30.0,
                     }],
                 ),
                 IncludeLaunchDescription(
@@ -130,10 +140,7 @@ def generate_launch_description():
                     ),
                     launch_arguments=[
                         ('use_sim_time', LaunchConfiguration('use_sim_time')),
-                        ('params_file', PathJoinSubstitution([
-                            FindPackageShare('go2_slam_nav'),
-                            'config', 'nav2_params_go2.yaml',
-                        ])),
+                        ('params_file', nav2_params),
                         ('autostart', 'true'),
                         ('log_level', LaunchConfiguration('log_level')),
                     ],

@@ -79,12 +79,12 @@ class ExplorePreroll(Node):
             self._nav_client = None
 
         scan_part = (
-            f' + rotate {math.degrees(self._scan_rotation_rad):.0f}°'
+            f'，原地旋转 {math.degrees(self._scan_rotation_rad):.0f}°'
             if self._scan_rotation_rad > 0.1 else ''
         )
         self.get_logger().info(
-            f'Explore preroll: drive {self._distance_m:.2f} m at '
-            f'{self._linear_speed:.2f} m/s{scan_part}, then wait for Nav2'
+            f'探索预滚动：前进 {self._distance_m:.2f} m，'
+            f'速度 {self._linear_speed:.2f} m/s{scan_part}，然后等待 Nav2'
         )
 
     @property
@@ -110,7 +110,7 @@ class ExplorePreroll(Node):
         self._move_start = self.get_clock().now()
         self._phase = _Phase.FORWARD
         self.get_logger().info(
-            f'Odom baseline: ({self._start_x:.3f}, {self._start_y:.3f})'
+            f'里程计基准点：({self._start_x:.3f}, {self._start_y:.3f})'
         )
 
     def _distance_traveled(self) -> float:
@@ -154,7 +154,7 @@ class ExplorePreroll(Node):
             self.get_clock().now()
             + rclpy.duration.Duration(seconds=self._nav2_wait_timeout)
         )
-        self.get_logger().info('Preroll motion done — waiting for Nav2 action server...')
+        self.get_logger().info('预滚动完成，等待 Nav2 就绪...')
 
     def _tick(self):
         if self.done:
@@ -166,13 +166,13 @@ class ExplorePreroll(Node):
             elapsed = (now - self._move_start).nanoseconds / 1e9
             if elapsed > self._max_duration:
                 self._finish(
-                    f'Max duration ({self._max_duration:.1f}s) reached — stopping preroll'
+                    f'预滚动超时 ({self._max_duration:.1f}s)，已停止'
                 )
                 return
 
         if self._phase == _Phase.WAIT_ODOM:
             if now >= self._odom_deadline:
-                self._finish('Odom timeout — skipping preroll')
+                self._finish('里程计超时，跳过预滚动')
             return
 
         if self._phase == _Phase.FORWARD:
@@ -186,7 +186,7 @@ class ExplorePreroll(Node):
                     )
                     self._phase = _Phase.ROTATE
                     self.get_logger().info(
-                        f'Forward complete: {traveled:.2f} m — rotating to scan surroundings'
+                        f'前进完成 {traveled:.2f} m，开始原地旋转扫图'
                     )
                 else:
                     self._enter_wait_nav2()
@@ -201,7 +201,7 @@ class ExplorePreroll(Node):
             rotated = self._update_rotation()
             if rotated >= self._scan_rotation_rad:
                 self.get_logger().info(
-                    f'Rotation scan complete: {math.degrees(rotated):.0f}°'
+                    f'旋转扫图完成 {math.degrees(rotated):.0f}°'
                 )
                 self._enter_wait_nav2()
                 return

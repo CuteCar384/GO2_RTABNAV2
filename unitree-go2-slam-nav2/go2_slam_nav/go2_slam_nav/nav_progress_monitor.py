@@ -47,7 +47,7 @@ class NavProgressMonitor(Node):
         super().__init__('nav_progress_monitor')
         self.declare_parameter('slam_mode', 'mapping')
         self.declare_parameter('heartbeat_sec', 8.0)
-        self.declare_parameter('stuck_heartbeat_sec', 4.0)
+        self.declare_parameter('frontier_stats_log_sec', 30.0)
         self.declare_parameter('aborted_warn_sec', 8.0)
         self.declare_parameter('nav_action_status_topic', '/navigate_to_pose/_action/status')
         self.declare_parameter('nav_action_feedback_topic', '/navigate_to_pose/_action/feedback')
@@ -58,7 +58,9 @@ class NavProgressMonitor(Node):
         slam_mode = str(self.get_parameter('slam_mode').value).strip().lower()
         self._mode_label = _MODE_LABELS.get(slam_mode, slam_mode or '建图')
         self._heartbeat_sec = max(5.0, float(self.get_parameter('heartbeat_sec').value))
-        self._stuck_heartbeat_sec = max(3.0, float(self.get_parameter('stuck_heartbeat_sec').value))
+        self._frontier_stats_log_sec = max(
+            10.0, float(self.get_parameter('frontier_stats_log_sec').value),
+        )
         self._aborted_warn_sec = max(2.0, float(self.get_parameter('aborted_warn_sec').value))
         self._nav_status_topic = str(self.get_parameter('nav_action_status_topic').value)
         self._explore_topic = str(self.get_parameter('explore_status_topic').value)
@@ -83,6 +85,7 @@ class NavProgressMonitor(Node):
         self._frontiers_available = 0
         self._last_heartbeat_key = None
         self._last_heartbeat_log_mono = 0.0
+        self._last_frontier_stats_log_mono = 0.0
 
         self.get_logger().set_level(LoggingSeverity.INFO)
 
@@ -131,12 +134,10 @@ class NavProgressMonitor(Node):
             Twist, self._cmd_vel_topic, self._on_cmd_vel, status_qos,
         )
 
-        self._heartbeat_period = self._heartbeat_sec
-        self._heartbeat_timer = self.create_timer(self._heartbeat_period, self._heartbeat)
+        self.create_timer(self._heartbeat_sec, self._heartbeat)
         self.get_logger().info(
             f'[任务进度] 导航监控已启动，模式={self._mode_label}，'
-            f'订阅 {self._nav_status_topic}，心跳 {self._heartbeat_sec:.0f}s'
-            f'（卡住时 {self._stuck_heartbeat_sec:.0f}s）。'
+            f'订阅 {self._nav_status_topic}，心跳 {self._heartbeat_sec:.0f}s。'
         )
 
     @staticmethod
@@ -319,14 +320,12 @@ class NavProgressMonitor(Node):
             return True
         return False
 
-    def _maybe_adjust_heartbeat_timer(self) -> None:
-        period = self._stuck_heartbeat_sec if self._is_stuck_like() else self._heartbeat_sec
-        if abs(period - self._heartbeat_period) < 0.1:
-            return
-        self._heartbeat_period = period
-        self._heartbeat_timer.cancel()
-        self._heartbeat_timer.destroy()
-        self._heartbeat_timer = self.create_timer(self._heartbeat_period, self._heartbeat)
+    def _should_log_frontier_stats(self) -> bool:
+        now = time.monotonic()
+        if (now - self._last_frontier_stats_log_mono) < self._frontier_stats_log_sec:
+            return False
+        self._last_frontier_stats_log_mono = now
+        return True
 
     def _on_nav_feedback(self, msg) -> None:
         feedback = msg.feedback
@@ -351,7 +350,11 @@ class NavProgressMonitor(Node):
                 f'[任务进度] 模式={self._mode_label} | 探索拉黑 | '
                 f'已拉黑 {blacklist} 点，可用前沿 {frontiers_available}/{frontiers_found}。'
             )
-        elif frontier_stats_changed and self._mode_label == '探索':
+        elif (
+            frontier_stats_changed
+            and self._mode_label == '探索'
+            and self._should_log_frontier_stats()
+        ):
             self.get_logger().info(
                 f'[任务进度] 模式={self._mode_label} | 前沿统计 | '
                 f'已拉黑 {blacklist} 点，可用前沿 {frontiers_available}/{frontiers_found}。'
@@ -432,8 +435,6 @@ class NavProgressMonitor(Node):
         return True
 
     def _heartbeat(self) -> None:
-        self._maybe_adjust_heartbeat_timer()
-
         if not self._nav2_server_available():
             if not self._should_log_heartbeat():
                 return
