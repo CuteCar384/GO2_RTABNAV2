@@ -15,3 +15,8 @@ string RETURNED_TO_ORIGIN=returned_to_origin
 
 # Current exploration status
 string status
+
+# Frontier stats (updated on each explore/status publish)
+uint32 blacklist_count
+uint32 frontiers_found
+uint32 frontiers_available
